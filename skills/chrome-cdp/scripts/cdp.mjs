@@ -19,6 +19,9 @@ const IDLE_TIMEOUT = 20 * 60 * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
+const CONSOLE_BUF_MAX = 500;
+const NET_BUF_MAX = 500;
+const NET_URL_MAX_CHARS = 120;
 const IS_WINDOWS = process.platform === 'win32';
 if (!IS_WINDOWS) process.umask(0o077);
 const RUNTIME_DIR = IS_WINDOWS
@@ -467,6 +470,118 @@ async function loadAllStr(cdp, sid, selector, intervalMs = 1500) {
   return `Clicked "${selector}" ${clicks} time(s) until it disappeared`;
 }
 
+const LOG_DISPLAY_MAX_CHARS = 200;
+
+// Format buffered network entries.
+//
+// Flags (all optional, combinable):
+//   failed           : only requests that failed (any error)
+//   blocked          : only requests blocked by the browser/extension (ERR_BLOCKED_BY_CLIENT)
+//   method=GET|POST  : filter by HTTP method
+//   status=N         : filter by exact HTTP status code
+//   grep=<text>      : case-insensitive substring match on URL
+//   last=N           : show only the last N entries (applied after other filters)
+//
+// Output columns: [idx] [time] [method] [status] [type] url  (+ error if failed)
+function netlogStr(buf, ...flags) {
+  let entries = [...buf];
+
+  for (const flag of flags) {
+    if (!flag) continue;
+    if (flag === 'failed') {
+      entries = entries.filter(e => e.failed);
+    } else if (flag === 'blocked') {
+      entries = entries.filter(e => e.errorText && e.errorText.includes('ERR_BLOCKED_BY_CLIENT'));
+    } else if (flag.startsWith('method=')) {
+      const m = flag.slice(7).toUpperCase();
+      entries = entries.filter(e => e.method === m);
+    } else if (flag.startsWith('status=')) {
+      const s = parseInt(flag.slice(7), 10);
+      entries = entries.filter(e => e.status === s);
+    } else if (flag.startsWith('grep=')) {
+      const needle = flag.slice(5).toLowerCase();
+      entries = entries.filter(e => e.url.toLowerCase().includes(needle));
+    } else if (flag.startsWith('last=')) {
+      const n = parseInt(flag.slice(5), 10);
+      if (!isNaN(n) && n > 0) entries = entries.slice(-n);
+    }
+  }
+
+  if (entries.length === 0) {
+    const desc = flags.filter(Boolean).join(' ');
+    return desc ? `No entries matching [${desc}] in network buffer.` : 'Network buffer is empty (daemon just attached, or no requests yet).';
+  }
+
+  return entries.map(e => {
+    const time = e.ts.slice(11, 19);
+    const method = (e.method || '?').padEnd(6);
+    const status = (e.status != null ? String(e.status) : e.failed ? 'FAIL' : '---').padEnd(5);
+    const type = (e.type || '').padEnd(12);
+    const url = e.url.length > NET_URL_MAX_CHARS
+      ? e.url.slice(0, NET_URL_MAX_CHARS) + `… (use: netdetail ${e.idx})`
+      : e.url;
+    const suffix = e.failed ? `  \u2717 ${e.errorText || ''}${e.blockedReason ? ` [${e.blockedReason}]` : ''}` : '';
+    return `[${e.idx}] [${time}] [${method}] [${status}] [${type}] ${url}${suffix}`;
+  }).join('\n');
+}
+
+// Format buffered console entries.
+//
+// Flags (all optional, combinable):
+//   level filter : all (default) | errors | warn | info | log | debug | exception
+//   source filter: source=console | source=exception | source=browser
+//   tail         : last=N  (show only the last N entries, applied after other filters)
+//   text search  : grep=<substring>  (case-insensitive)
+//
+// Each entry text is truncated to LOG_DISPLAY_MAX_CHARS.
+// Truncated entries show their index and a hint — use logdetail <N> to get the full text.
+//
+// Examples:
+//   logs <t>                          all entries
+//   logs <t> errors                   error + exception levels
+//   logs <t> warn                     warnings only
+//   logs <t> source=browser           browser-generated messages only
+//   logs <t> last=20                  last 20 entries
+//   logs <t> errors last=10           last 10 errors
+//   logs <t> grep=TypeError           entries containing "TypeError"
+//   logs <t> errors source=console grep=fetch last=5
+function logsStr(buf, ...flags) {
+  let entries = [...buf];
+
+  for (const flag of flags) {
+    if (!flag) continue;
+    if (flag.startsWith('source=')) {
+      const src = flag.slice(7);
+      entries = entries.filter(e => e.source === src);
+    } else if (flag.startsWith('last=')) {
+      const n = parseInt(flag.slice(5), 10);
+      if (!isNaN(n) && n > 0) entries = entries.slice(-n);
+    } else if (flag.startsWith('grep=')) {
+      const needle = flag.slice(5).toLowerCase();
+      entries = entries.filter(e => e.text.toLowerCase().includes(needle));
+    } else if (flag === 'errors') {
+      entries = entries.filter(e => e.level === 'error' || e.level === 'exception');
+    } else if (flag !== 'all') {
+      entries = entries.filter(e => e.level === flag);
+    }
+  }
+
+  if (entries.length === 0) {
+    const desc = flags.filter(Boolean).join(' ');
+    return desc ? `No entries matching [${desc}] in console buffer.` : 'Console buffer is empty (daemon just attached, or no output yet).';
+  }
+  return entries.map(e => {
+    const time = e.ts.slice(11, 19);
+    const level = e.level.padEnd(9);
+    const source = e.source.padEnd(9);
+    const truncated = e.text.length > LOG_DISPLAY_MAX_CHARS;
+    const text = truncated
+      ? e.text.slice(0, LOG_DISPLAY_MAX_CHARS) + `… (+${e.text.length - LOG_DISPLAY_MAX_CHARS} chars, use: logdetail ${e.idx})`
+      : e.text;
+    return `[${e.idx}] [${time}] [${level}] [${source}] ${text}`;
+  }).join('\n');
+}
+
 // Send a raw CDP command and return the result as JSON
 async function evalRawStr(cdp, sid, method, paramsJson) {
   if (!method) throw new Error('CDP method required (e.g. "DOM.getDocument")');
@@ -503,6 +618,124 @@ async function runDaemon(targetId) {
     cdp.close();
     process.exit(1);
   }
+
+  // ---------------------------------------------------------------------------
+  // Console log buffer — mirrors what you see in DevTools console
+  // ---------------------------------------------------------------------------
+  const consoleBuf = [];
+  let logIdx = 0;
+  function pushLog(entry) {
+    entry.idx = logIdx++;
+    consoleBuf.push(entry);
+    if (consoleBuf.length > CONSOLE_BUF_MAX) consoleBuf.shift();
+  }
+
+  // Enable domains and subscribe to all three console streams
+  try {
+    await cdp.send('Runtime.enable', {}, sessionId);
+    await cdp.send('Log.enable', {}, sessionId);
+  } catch (e) {
+    process.stderr.write(`Daemon: console stream enable failed: ${e.message}\n`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Network request buffer — mirrors what you see in DevTools Network tab
+  // ---------------------------------------------------------------------------
+  const netBuf = [];
+  const netByRequestId = new Map();
+  let netIdx = 0;
+  function pushNet(entry) {
+    entry.idx = netIdx++;
+    netBuf.push(entry);
+    netByRequestId.set(entry.requestId, entry);
+    if (netBuf.length > NET_BUF_MAX) {
+      const evicted = netBuf.shift();
+      netByRequestId.delete(evicted.requestId);
+    }
+  }
+
+  try {
+    await cdp.send('Network.enable', {}, sessionId);
+  } catch (e) {
+    process.stderr.write(`Daemon: Network.enable failed: ${e.message}\n`);
+  }
+
+  cdp.onEvent('Network.requestWillBeSent', (params) => {
+    pushNet({
+      ts: new Date(params.wallTime * 1000).toISOString(),
+      requestId: params.requestId,
+      method: params.request.method,
+      url: params.request.url,
+      type: params.type || '',
+      requestHeaders: params.request.headers || {},
+      requestBody: params.request.postData || null,
+      status: null,
+      failed: false,
+      errorText: null,
+      blockedReason: null,
+    });
+  });
+
+  cdp.onEvent('Network.responseReceived', (params) => {
+    const entry = netByRequestId.get(params.requestId);
+    if (entry) entry.status = params.response.status;
+  });
+
+  cdp.onEvent('Network.loadingFailed', (params) => {
+    const entry = netByRequestId.get(params.requestId);
+    if (entry) {
+      entry.failed = true;
+      entry.errorText = params.errorText || null;
+      entry.blockedReason = params.blockedReason || null;
+    }
+  });
+
+  // Serialize a RemoteObject arg eagerly.
+  // Primitives: use value directly.
+  // Objects: JSON.stringify via callFunctionOn while objectId is still alive.
+  // Falls back to CDP preview if callFunctionOn fails (context already gone).
+  async function serializeArg(arg) {
+    if (arg.value !== undefined) return String(arg.value);
+    if (arg.objectId) {
+      try {
+        const res = await cdp.send('Runtime.callFunctionOn', {
+          objectId: arg.objectId,
+          functionDeclaration: 'function() { try { return JSON.stringify(this, null, 2); } catch(e) { return String(this); } }',
+          returnByValue: true,
+        }, sessionId);
+        if (res.result?.value !== undefined) return res.result.value;
+      } catch { /* objectId released — fall through to preview */ }
+    }
+    if (arg.preview?.properties?.length) {
+      const props = arg.preview.properties.map(p => `${p.name}: ${p.value}`).join(', ');
+      return `${arg.description} { ${props}${arg.preview.overflow ? ', ...' : ''} }`;
+    }
+    return arg.description ?? arg.type;
+  }
+
+  // 1. console.log / .warn / .error / .info / .debug / etc.
+  cdp.onEvent('Runtime.consoleAPICalled', async (params) => {
+    const parts = await Promise.all(params.args.map(serializeArg));
+    pushLog({
+      ts: new Date(params.timestamp).toISOString(),
+      level: params.type,
+      source: 'console',
+      text: parts.join(' '),
+    });
+  });
+
+  // 2. Unhandled JS exceptions and promise rejections
+  cdp.onEvent('Runtime.exceptionThrown', (params) => {
+    const ex = params.exceptionDetails;
+    const text = ex.exception?.description ?? ex.text ?? 'Unknown exception';
+    pushLog({ ts: new Date(params.timestamp).toISOString(), level: 'exception', source: 'exception', text });
+  });
+
+  // 3. Browser-generated messages: network errors, CSP violations, deprecations, etc.
+  cdp.onEvent('Log.entryAdded', (params) => {
+    const e = params.entry;
+    pushLog({ ts: new Date(e.timestamp).toISOString(), level: e.level, source: 'browser', text: e.text });
+  });
 
   // Shutdown helpers
   let alive = true;
@@ -560,6 +793,22 @@ async function runDaemon(targetId) {
         case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
         case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
         case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
+        case 'netlog': result = netlogStr(netBuf, ...args); break;
+        case 'netdetail': {
+          const n = parseInt(args[0], 10);
+          const entry = netBuf.find(e => e.idx === n);
+          if (!entry) { result = `No entry with index ${n} in network buffer.`; break; }
+          result = JSON.stringify(entry, null, 2);
+          break;
+        }
+        case 'logs': result = logsStr(consoleBuf, ...args); break;
+        case 'logdetail': {
+          const n = parseInt(args[0], 10);
+          const entry = consoleBuf.find(e => e.idx === n);
+          if (!entry) { result = `No entry with index ${n} in buffer.`; break; }
+          result = `[${entry.idx}] [${entry.ts.slice(11, 19)}] [${entry.level}] [${entry.source}]\n${entry.text}`;
+          break;
+        }
         case 'stop': return { ok: true, result: '', stopAfter: true };
         default: return { ok: false, error: `Unknown command: ${cmd}` };
       }
@@ -739,6 +988,15 @@ Usage: cdp <command> [args]
                                     Optional interval in ms between clicks (default 1500)
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
+  logs      <target> [flags...]      Show buffered console output; entries truncated to 200 chars
+                                    Flags (combinable): all | errors | warn | info | log | debug | exception
+                                                        source=console | source=exception | source=browser
+                                                        last=N  grep=<text>
+  logdetail <target> <N>            Full text of entry N (index shown in logs output)
+  netlog    <target> [flags...]      Show buffered network requests captured since daemon attached
+                                    Flags (combinable): failed | blocked | method=GET|POST|...
+                                                        status=N (exact) | grep=<url-text> | last=N
+  netdetail <target> <N>            Full JSON details of network entry N
   open  [url]                       Open a new tab (default: about:blank)
                                     Note: each new tab triggers a fresh "Allow debugging?" prompt
   stop  [target]                    Stop daemon(s)
@@ -776,7 +1034,7 @@ DAEMON IPC (for advanced use / scripting)
 
 const NEEDS_TARGET = new Set([
   'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
-  'net','network','click','clickxy','type','loadall','evalraw',
+  'net','network','click','clickxy','type','loadall','evalraw','logs','logdetail','netlog','netdetail',
 ]);
 
 async function main() {

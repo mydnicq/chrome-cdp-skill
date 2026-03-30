@@ -56,6 +56,15 @@ scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords
 scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes unlike eval
 scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
+scripts/cdp.mjs logs    <target> [flags...]         # console output buffered since daemon attached
+                                                   # flags (combinable): all | errors | warn | info | log | debug | exception
+                                                   #                     source=console | source=exception | source=browser
+                                                   #                     last=N | grep=<text>
+scripts/cdp.mjs logdetail <target> <N>             # full text of entry N (index shown in logs output)
+scripts/cdp.mjs netlog   <target> [flags...]        # network requests buffered since daemon attached
+                                                   # flags (combinable): failed | blocked | method=GET|POST|...
+                                                   #                     status=N | grep=<url-text> | last=N
+scripts/cdp.mjs netdetail <target> <N>             # full JSON details of network entry N (index shown in netlog)
 scripts/cdp.mjs open    [url]                  # open new tab (each triggers Allow prompt)
 scripts/cdp.mjs stop    [target]               # stop daemon(s)
 ```
